@@ -1,0 +1,94 @@
+# Coach — .gitignore (standard + project specific)
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtualenv
+.venv/
+venv/
+ENV/
+env/
+coach-venv/
+
+# Byte-compiled / optimized
+__pycache__/
+*.pyo
+*.pyd
+
+# IDE / editors
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment & secrets (never commit)
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+
+# Logs & runtime
+*.log
+logs/
+*.pid
+
+# Backups & dumps (local)
+backups/
+*.dump
+*.sql
+coach_proto*.sql
+
+# Test / coverage
+.coverage
+htmlcov/
+.tox/
+.nox/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Node / frontend tooling (if ever added)
+node_modules/
+package-lock.json
+yarn.lock
+
+# Temporary / scratch
+tmp/
+temp/
+*.tmp
+scratch/
+
+# Git worktree artifacts (if used)
+.git/
+
+# Do not commit compiled pyc from any location
+**/__pycache__/
+**/*.pyc

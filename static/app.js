@@ -1,0 +1,487 @@
+/* Strava activity calls use the authenticated Coach session. */
+(() => {
+  const $ = id => document.getElementById(id);
+  const panel = $('settings-panel'), trigger = $('open-settings'), overlay = $('overlay');
+  const table = $('timeline'), dialog = $('detail');
+  const discussionId = sessionStorage.getItem('coachDiscussionId') || `temporary:${crypto.randomUUID()}`;
+  sessionStorage.setItem('coachDiscussionId', discussionId);
+  let items = [], conversation = [], selectedItems = new Set(), contextBusy = new Set(), lang = 'fr', busy = false, previousFocus;
+  const copy = {
+    fr: { load: 'Chargement…', empty: 'Aucun résultat.', error: 'Impossible de charger les données.', detailError: 'Détails indisponibles.', activity: 'Activité', artifact: 'Document MD', syncing: 'Synchronisation Strava…', syncError: 'Synchronisation impossible.', levelError: 'Niveau indisponible.', addContext: 'Ajouter au contexte', removeContext: 'Retirer du contexte', added: 'Ajouté', noContext: 'Aucun élément ajouté au contexte.', contextCount: count => `${count} élément${count>1?'s':''} déposé${count>1?'s':''} dans le contexte de cette discussion.`, contextError: 'Mise à jour du contexte impossible.' },
+    en: { load: 'Loading…', empty: 'No results.', error: 'Unable to load data.', detailError: 'Details unavailable.', activity: 'Activity', artifact: 'Markdown note', syncing: 'Syncing Strava…', syncError: 'Sync failed.', levelError: 'Level unavailable.', addContext: 'Add to context', removeContext: 'Remove from context', added: 'Added', noContext: 'No items added to this discussion context.', contextCount: count => `${count} item${count===1?'':'s'} added to this discussion context.`, contextError: 'Unable to update context.' }
+  };
+  function open() {
+    previousFocus = document.activeElement; overlay.hidden = false; panel.inert = false;
+    panel.classList.add('open'); panel.setAttribute('aria-hidden','false'); trigger.setAttribute('aria-expanded','true');
+    $('close-settings').focus();
+    loadLevel();
+    if (!items.length) load();
+  }
+  function close() {
+    panel.classList.remove('open'); panel.setAttribute('aria-hidden','true'); panel.inert = true;
+    overlay.hidden = true; trigger.setAttribute('aria-expanded','false'); (previousFocus || trigger).focus();
+  }
+  trigger.addEventListener('click',open); $('close-settings').addEventListener('click',close); overlay.addEventListener('click',close);
+  panel.addEventListener('keydown', event => {
+    if (event.key !== 'Tab') return;
+    const focusable = [...panel.querySelectorAll('button:not([disabled]),a[href],input:not([disabled]),select:not([disabled])')];
+    if (!focusable.length) return;
+    if (event.shiftKey && document.activeElement === focusable[0]) { event.preventDefault(); focusable.at(-1).focus(); }
+    else if (!event.shiftKey && document.activeElement === focusable.at(-1)) { event.preventDefault(); focusable[0].focus(); }
+  });
+  document.addEventListener('keydown', event => { if (event.key === 'Escape') { if (dialog.open) dialog.close(); else if (panel.classList.contains('open')) close(); } });
+  $('detail-close').addEventListener('click', () => dialog.close());
+  dialog.addEventListener('click', event => { if (event.target === dialog) dialog.close(); });
+  $('language').addEventListener('change', event => { lang = event.target.value === 'en' ? 'en' : 'fr'; document.documentElement.lang = lang; render(); updateContextStatus(); });
+  $('athlete-profile-form').addEventListener('submit', async event => {
+    event.preventDefault();
+    const form=event.currentTarget, status=$('profile-status'), field=id=>$(id).value.trim();
+    const optionalInteger=value=>value===''?null:Number.parseInt(value,10);
+    const weight=field('profile-weight');
+    try {
+      const response=await fetch('/api/profile',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify({
+        weight_kg:weight===''?null:Number.parseFloat(weight), ftp_watts:optionalInteger(field('profile-ftp')),
+        max_heartrate:optionalInteger(field('profile-hrmax'))
+      })});
+      const result=await response.json(); if(!response.ok) throw new Error(result.detail || 'Enregistrement impossible');
+      status.textContent='Constantes enregistrées.'; await loadLevel();
+    } catch(error) { status.textContent=error.message || 'Enregistrement impossible.'; }
+  });
+  $('coupon-form').addEventListener('submit', async event => {
+    event.preventDefault();
+    const form=event.currentTarget, status=$('coupon-status'), button=form.querySelector('button[type="submit"]');
+    button.disabled=true; status.textContent='Validation…';
+    try {
+      const response=await fetch(form.action,{method:'POST',credentials:'same-origin',body:new FormData(form)});
+      const result=await response.json();
+      if(!response.ok) throw new Error(result.detail || 'Code coupon invalide ou indisponible.');
+      const micro=result.credit_micro_usd;
+      if(!updateCreditBalance(micro)) throw new Error('Solde de crédit invalide.');
+      status.textContent=result.message;
+    } catch(error) { status.textContent=error.message || 'Validation impossible.'; }
+    finally { button.disabled=false; }
+  });
+  $('filter').addEventListener('input',render); $('sort').addEventListener('change',render);
+  $('chat-form').addEventListener('submit', async event => {
+    event.preventDefault(); if (busy) return;
+    const input=$('chat-input'), text=input.value.trim(); if (!text) return;
+    const select=$('model-choice'), modelId=select.value;
+    const modelName=select.selectedOptions[0]?.textContent?.trim() || modelId;
+    busy=true; const button=$('chat-form').querySelector('button[type="submit"]'); button.disabled=true;
+    addMessage('user',text); conversation.push({role:'user',content:text,model_id:modelId,model_name:modelName});
+    let historyCharacters=conversation.reduce((total,item)=>total+item.content.length,0);
+    while((historyCharacters>30000 || conversation.length>20) && conversation.length>1) historyCharacters-=conversation.shift().content.length;
+    const generatedAt=new Date().toISOString(), responseKey=crypto.randomUUID();
+    const pending=addMessage('assistant','',{modelId,modelName});
+    pending.generatedAt=generatedAt; pending.responseKey=responseKey;
+    const live=createLiveViews(pending);
+    input.value=''; input.style.height='auto';
+    try {
+      const response=await fetch('/api/chat',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify({model:modelId,discussion_id:discussionId,messages:conversation.map(({role,content})=>({role,content}))})});
+      if(!response.ok) {
+        const result=await response.json();
+        const fallback={400:'Requête invalide.',402:'Solde insuffisant.',403:'Ce modèle n’est pas disponible.',500:'Débit impossible, réessayez.',502:'Ce modèle ne répond pas.',503:'Ce modèle n’est pas disponible.'};
+        const detail=typeof result.detail==='string' && result.detail.trim() ? result.detail : fallback[response.status] || 'Ce modèle ne répond pas.';
+        throw new Error(detail);
+      }
+      if (!response.body) throw new Error('Flux du modèle indisponible');
+      const reader=response.body.getReader(), decoder=new TextDecoder();
+      let buffer='', settled=null, finished=false, explicitStreamError=false;
+      const consumeBlock=block=>{
+        let eventName='message', dataText='';
+        for (const line of block.split(/\r?\n/)) {
+          if (line.startsWith('event:')) eventName=line.slice(6).trim();
+          else if (line.startsWith('data:')) dataText+=(dataText?'\n':'')+line.slice(5).trimStart();
+        }
+        if (!dataText) return;
+        const value=JSON.parse(dataText);
+        if (eventName==='openwebui') renderOpenWebUIEvent(value,live,pending);
+        else if (eventName==='settled') {
+          settled=value;
+          if (!['coach-gratuit-1','coach-gratuit-2'].includes(modelId) && value.charged_micro_usd > 0) {
+            updateCreditBalance(value.balance_micro_usd);
+          }
+        }
+        else if (eventName==='error') { explicitStreamError=true; throw new Error(value.detail || 'Réponse du modèle interrompue'); }
+        else if (eventName==='done') finished=true;
+      };
+      while (!finished) {
+        const {value,done}=await reader.read();
+        buffer+=decoder.decode(value || new Uint8Array(),{stream:!done});
+        let boundary;
+        while ((boundary=buffer.search(/\r?\n\r?\n/))>=0) {
+          const block=buffer.slice(0,boundary), separator=buffer.match(/\r?\n\r?\n/);
+          buffer=buffer.slice(boundary+separator[0].length); consumeBlock(block);
+          if (finished) break;
+        }
+        if (done) { if (buffer.trim()) consumeBlock(buffer); break; }
+      }
+      if (!settled || !finished) throw new Error('Le flux s’est interrompu avant la livraison complète');
+      const settledContent=typeof settled.content==='string' ? settled.content : '';
+      const delivered=settledContent.trim() ? settledContent : live.answer.textContent;
+      if (!delivered.trim()) throw new Error('Réponse du modèle incomplète');
+      if (settledContent.trim()) appendAnswer(live,settledContent,true);
+      addCostLine(pending.bubble,modelId,settled.charged_micro_usd,settled.balance_micro_usd);
+      addRememberButton(pending, delivered);
+      conversation.push({role:'assistant',content:delivered,model_id:modelId,model_name:modelName});
+    } catch(error) {
+      if (explicitStreamError || !live.answer.textContent.trim()) pending.row.remove();
+      addSystemLine(error.message || 'Ce modèle ne répond pas.');
+    }
+    finally { busy=false; button.disabled=false; }
+  });
+  $('chat-input').addEventListener('input',event => { event.target.style.height='auto'; event.target.style.height=Math.min(event.target.scrollHeight,130)+'px'; });
+  $('chat-input').addEventListener('keydown',event => { if (event.key==='Enter' && !event.shiftKey && !event.isComposing) { event.preventDefault(); $('chat-form').requestSubmit(); } });
+  if ($('sync-strava')) $('sync-strava').addEventListener('click',syncStrava);
+
+  function num(value, unit='') { return value == null ? '—' : `${Number(value).toLocaleString(lang, {maximumFractionDigits:1})}${unit}`; }
+  function date(value) { const d = new Date(value); return Number.isNaN(+d) ? '—' : d.toLocaleString(lang, {dateStyle:'short',timeStyle:'short'}); }
+  function cell(row,text) { const td = document.createElement('td'); td.textContent = text ?? '—'; row.appendChild(td); return td; }
+  function message(text) { table.replaceChildren(); const row = document.createElement('tr'); cell(row,text).colSpan = 6; table.appendChild(row); }
+  function contextKey(item) { return `${item.type}:${item.id}`; }
+  function updateContextStatus() {
+    const status=$('context-status'), count=selectedItems.size;
+    status.textContent=count ? copy[lang].contextCount(count) : copy[lang].noContext;
+    status.classList.toggle('has-selection',count>0);
+  }
+  async function loadContextSelection() {
+    try {
+      const response=await fetch(`/api/context/${encodeURIComponent(discussionId)}`,{credentials:'same-origin'});
+      if(response.status===404) { selectedItems.clear(); render(); updateContextStatus(); return; }
+      if(!response.ok) throw Error();
+      const selection=await response.json();
+      selectedItems=new Set([...(selection.activities||[]).map(id=>`activity:${id}`),...(selection.artifacts||[]).map(id=>`artifact:${id}`)]);
+      render(); updateContextStatus();
+    } catch (_) { $('context-status').textContent=copy[lang].contextError; }
+  }
+  async function toggleContext(item, button) {
+    const key=contextKey(item); if(contextBusy.has(key)) return;
+    const selected=!selectedItems.has(key); contextBusy.add(key); button.disabled=true;
+    try {
+      const response=await fetch(`/api/context/${encodeURIComponent(discussionId)}/items`,{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify({item_type:item.type,item_id:item.id,selected})});
+      const result=await response.json(); if(!response.ok) throw new Error(result.detail || copy[lang].contextError);
+      selectedItems=new Set([...(result.activities||[]).map(id=>`activity:${id}`),...(result.artifacts||[]).map(id=>`artifact:${id}`)]);
+      updateContextStatus(); render();
+    } catch(error) { $('context-status').textContent=error.message || copy[lang].contextError; }
+    finally { contextBusy.delete(key); render(); }
+  }
+  function render() {
+    const query = $('filter').value.trim().toLocaleLowerCase();
+    const list = items.filter(i => `${i.title} ${i.subtype} ${i.type}`.toLocaleLowerCase().includes(query));
+    list.sort((a,b) => $('sort').value === 'title'
+      ? a.title.localeCompare(b.title,lang)
+      : ($('sort').value === 'recent' ? -1 : 1) * (Date.parse(a.date)-Date.parse(b.date)));
+    if (!list.length) { message(copy[lang].empty); return; }
+    table.replaceChildren();
+    list.forEach(item => {
+      const tr = document.createElement('tr'); tr.tabIndex = 0;
+      cell(tr,date(item.date));
+      cell(tr,`${item.type === 'artifact' ? '📄' : '🔶'} ${item.type === 'artifact' ? copy[lang].artifact : copy[lang].activity}`);
+      cell(tr,item.title); cell(tr,num(item.duration_minutes,' min')); cell(tr,num(item.distance_km,' km'));
+      const actionCell=document.createElement('td'), selected=selectedItems.has(contextKey(item)), action=document.createElement('button');
+      action.type='button'; action.className=`context-toggle${selected?' selected':''}`; action.textContent=selected?`✓ ${copy[lang].added}`:`＋ ${copy[lang].addContext}`;
+      action.setAttribute('aria-pressed',String(selected)); action.setAttribute('aria-label',`${selected?copy[lang].removeContext:copy[lang].addContext} : ${item.title}`);
+      action.addEventListener('click',event=>{event.stopPropagation();toggleContext(item,action);}); actionCell.appendChild(action); tr.appendChild(actionCell);
+      tr.addEventListener('click', () => detail(item));
+      tr.addEventListener('keydown',e => { if (e.target===tr && (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); detail(item); } });
+      table.appendChild(tr);
+    });
+  }
+  async function load() {
+    try {
+      const response = await fetch('/api/timeline', {credentials:'same-origin'});
+      if (!response.ok) throw Error(`HTTP ${response.status}`);
+      items = await response.json(); if (!Array.isArray(items)) throw Error('Invalid response'); render();
+    } catch (_) { message(copy[lang].error); }
+  }
+  function showLevel(snapshot) {
+    const target = $('level-snapshot'); target.replaceChildren();
+    const dl = document.createElement('dl'); dl.className='profile';
+    const fields = [
+      ['Niveau', snapshot.lvl == null ? '—' : `${snapshot.lvl}/100`],
+      ['Tendance', snapshot.tr == null ? '—' : `${snapshot.tr > 0 ? '+' : ''}${snapshot.tr}`],
+      ['FTP estimé', num(snapshot.ftp,' W')],
+      ['FTP relatif', num(snapshot.ftp_wkg,' W/kg')],
+      ...Object.entries(snapshot.sc || {}).map(([name,value]) => [name,`${value}/100`]),
+    ];
+    fields.forEach(([label,value]) => { const wrap=document.createElement('div'), dt=document.createElement('dt'), dd=document.createElement('dd'); dt.textContent=label; dd.textContent=value; wrap.append(dt,dd); dl.appendChild(wrap); });
+    const note=document.createElement('p'); note.className='hint'; note.textContent=`Calcul au ${snapshot.asof || '—'} · records de puissance réelle uniquement.`;
+    target.append(dl,note);
+  }
+  async function loadLevel() {
+    try { const response=await fetch('/api/level',{credentials:'same-origin'}); if(!response.ok) throw Error(); showLevel(await response.json()); }
+    catch (_) { $('level-snapshot').textContent=copy[lang].levelError; }
+  }
+  async function loadOpenWebUIModels() {
+    const select = $('model-choice');
+    try {
+      const response = await fetch('/api/openwebui/models', {credentials:'same-origin'});
+      if (!response.ok) throw Error('Unable to load models');
+      const models = await response.json();
+      if (!Array.isArray(models) || !models.length) throw Error('No models available');
+      select.replaceChildren(...models.map(model => new Option(model.name, model.id)));
+    } catch (_) {
+      const unavailable = new Option('Modèles indisponibles', '');
+      unavailable.disabled = true;
+      select.replaceChildren(unavailable);
+    }
+  }
+  async function syncStrava() {
+    const button=$('sync-strava'), status=$('sync-status'); if(!button || button.disabled) return;
+    button.disabled=true; status.textContent=copy[lang].syncing;
+    try {
+      const response=await fetch('/api/activities/refresh',{method:'POST',credentials:'same-origin'});
+      const result=await response.json(); if(!response.ok) throw new Error(result.detail || copy[lang].syncError);
+      status.textContent=`${result.mode === 'initial' ? 'Import initial' : 'Actualisation'} : ${result.imported} activité(s), ${result.compacted} résumé(s) compact(s).`;
+      items=[]; await load(); await loadLevel();
+    } catch (error) { status.textContent=error.message || copy[lang].syncError; }
+    finally { button.disabled=false; }
+  }
+  async function showCompact(activity, segment=null) {
+    const response=await fetch(`/api/activities/${encodeURIComponent(activity.id)}/compact${segment ? `?segment=${encodeURIComponent(segment)}` : ''}`,{credentials:'same-origin'});
+    const body=await response.json();
+    if(!response.ok) throw new Error(body.detail || copy[lang].detailError);
+    const heading=document.createElement('h3'); heading.textContent=segment ? `Résumé compact (${segment})` : 'Résumé compact';
+    const count=document.createElement('p'); count.className='hint'; count.textContent=`${response.headers.get('X-Compact-Characters') || JSON.stringify(body).length} caractères JSON`;
+    const pre=document.createElement('pre'); pre.className='markdown'; pre.textContent=JSON.stringify(body);
+    $('detail-body').append(heading,count,pre);
+  }
+  async function detail(item) {
+    $('detail-title').textContent = item.title; $('detail-body').textContent = copy[lang].load; dialog.showModal();
+    try {
+      const response = await fetch(`/api/timeline/${item.type}/${encodeURIComponent(item.id)}`, {credentials:'same-origin'});
+      if (!response.ok) throw Error(`HTTP ${response.status}`);
+      const data = await response.json(), body = $('detail-body'); body.replaceChildren();
+      if (item.type === 'artifact') {
+        const pre = document.createElement('pre'); pre.className = 'markdown'; pre.textContent = data.markdown; body.appendChild(pre);
+        const download = document.createElement('button'); download.textContent = 'Télécharger .md'; download.type = 'button';
+        download.addEventListener('click', () => {
+          const url = URL.createObjectURL(new Blob([data.markdown], {type:'text/markdown;charset=utf-8'}));
+          const link = document.createElement('a'); link.href = url; link.download = `document-${item.id}.md`; link.click(); setTimeout(() => URL.revokeObjectURL(url),1000);
+        }); body.appendChild(download);
+      } else {
+        const dl = document.createElement('dl');
+        [['Date',date(data.date)],['Durée',num(data.duration_minutes,' min')],['Distance',num(data.distance_km,' km')],['Puissance',num(data.avg_watts,' W')],['Note',data.notes || '—']].forEach(([label,value]) => {
+          const div = document.createElement('div'), dt = document.createElement('dt'), dd = document.createElement('dd'); dt.textContent=label; dd.textContent=value; div.append(dt,dd); dl.appendChild(div);
+        }); body.appendChild(dl);
+        const compact=document.createElement('button'); compact.textContent='Voir le JSON compact'; compact.addEventListener('click',()=>showCompact(item).catch(error=>{body.append(document.createTextNode(error.message));})); body.appendChild(compact);
+        const race=document.createElement('button'); race.textContent='Résumé course · segment continu le plus long'; race.addEventListener('click',()=>showCompact(item,'longest').catch(error=>{body.append(document.createTextNode(error.message));})); body.appendChild(race);
+      }
+    } catch (_) { $('detail-body').textContent = copy[lang].detailError; }
+  }
+  function addMessage(role,text,model=null) {
+    const row = document.createElement('div'); row.className=`message ${role}`;
+    const icon=document.createElement('span'); icon.className='icon'; icon.textContent=role==='user'?'👤':'🤖';
+    const bubble=document.createElement('div'); bubble.className='bubble';
+    if (role==='assistant' && model) {
+      const label=document.createElement('small'); label.className='model-label'; label.textContent=model.modelName;
+      bubble.appendChild(label);
+    }
+    const content=document.createElement('div'); content.className='answer-text'; content.textContent=text;
+    bubble.appendChild(content); row.append(icon,bubble); $('messages').appendChild(row); $('messages').scrollTop=$('messages').scrollHeight;
+    return {row,bubble,content,model_id:model?.modelId,model_name:model?.modelName};
+  }
+  function createLiveViews(pending) {
+    const reasoning=document.createElement('details'); reasoning.className='live-reasoning'; reasoning.open=true; reasoning.hidden=true;
+    const summary=document.createElement('summary'); summary.textContent='Réflexion du modèle';
+    const reasoningText=document.createElement('div'); reasoningText.className='live-reasoning-text';
+    reasoning.append(summary,reasoningText);
+    const tools=document.createElement('section'); tools.className='live-tools'; tools.hidden=true;
+    const heading=document.createElement('strong'); heading.textContent='Fonctions et actions';
+    const toolList=document.createElement('ul'); tools.append(heading,toolList);
+    const artifacts=document.createElement('section'); artifacts.className='live-artifacts'; artifacts.hidden=true;
+    const artifactHeading=document.createElement('strong'); artifactHeading.textContent='Artefacts en direct';
+    artifacts.appendChild(artifactHeading);
+    pending.bubble.insertBefore(reasoning,pending.content);
+    pending.bubble.insertBefore(tools,pending.content);
+    pending.bubble.insertBefore(artifacts,pending.content);
+    return {answer:pending.content,reasoning,reasoningText,tools,toolList,toolSteps:new Map(),toolCallStates:new Map(),artifacts,artifactItems:new Map()};
+  }
+  function liveToolStep(live,key,label,done=false) {
+    key=String(key || label || 'action');
+    let entry=live.toolSteps.get(key);
+    if (!entry) {
+      const item=document.createElement('li'), checkbox=document.createElement('input'), text=document.createElement('span');
+      checkbox.type='checkbox'; checkbox.disabled=true; text.textContent=label || 'Action du class tool';
+      item.append(checkbox,text); live.toolList.appendChild(item); entry={item,checkbox,text}; live.toolSteps.set(key,entry);
+    } else if (label) entry.text.textContent=label;
+    live.tools.hidden=false; entry.checkbox.checked=Boolean(done); entry.checkbox.indeterminate=!done;
+    return entry;
+  }
+  function appendReasoning(live,text) {
+    if (typeof text!=='string' || !text) return;
+    live.reasoning.hidden=false; live.reasoningText.append(document.createTextNode(text));
+  }
+  function appendAnswer(live,text,replace=false) {
+    if (typeof text!=='string' || !text) return;
+    if (replace) live.answer.textContent=text;
+    else live.answer.append(document.createTextNode(text));
+    if (text.trim() && !live.answerStarted) {
+      live.answerStarted=true;
+      if (!live.reasoning.hidden) live.reasoning.open=false;
+    }
+  }
+  function addRememberButton(pending, content) {
+    const footer=document.createElement('div'); footer.className='answer-actions';
+    const button=document.createElement('button'); button.type='button'; button.textContent='Mémoriser la réponse';
+    const status=document.createElement('span'); status.setAttribute('role','status'); status.setAttribute('aria-live','polite');
+    button.addEventListener('click', async () => {
+      button.disabled=true; status.textContent='Enregistrement…';
+      try {
+        const response=await fetch('/api/artifacts/response',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify({content,generated_at:pending.generatedAt,source_key:pending.responseKey})});
+        const result=await response.json();
+        if(!response.ok) throw new Error(result.detail || 'Mémorisation impossible.');
+        items=[]; await load(); status.textContent='Réponse mémorisée.'; button.textContent='Réponse mémorisée';
+      } catch(error) { status.textContent=error.message || 'Mémorisation impossible.'; button.disabled=false; }
+    });
+    footer.append(button,status); pending.bubble.appendChild(footer);
+  }
+  function addLiveArtifact(live,key,title,content,kind='text') {
+    key=String(key || title || 'artifact');
+    let item=live.artifactItems.get(key);
+    if (!item) {
+      item=document.createElement('details'); item.className='live-artifact'; item.open=true;
+      const summary=document.createElement('summary'); summary.textContent=title || 'Artefact'; item.appendChild(summary);
+      const body=document.createElement('div'); body.className='live-artifact-body'; item.appendChild(body);
+      live.artifacts.appendChild(item); live.artifactItems.set(key,{item,body,summary}); live.artifacts.hidden=false;
+    }
+    const ref=live.artifactItems.get(key);
+    if (title) ref.summary.textContent=title;
+    if (kind==='embed' && typeof content==='string') {
+      const frame=document.createElement('iframe'); frame.title=title || 'Artefact intégré';
+      frame.setAttribute('sandbox','allow-scripts'); frame.referrerPolicy='no-referrer';
+      if (/^https:\/\//i.test(content)) frame.src=content; else frame.srcdoc=content;
+      ref.body.replaceChildren(frame);
+    } else if (content != null && typeof content==='string') {
+      const pre=document.createElement('pre'); pre.className='markdown'; pre.textContent=content; ref.body.replaceChildren(pre);
+    }
+  }
+  function renderOpenWebUIEvent(event,live,pending) {
+    if (!event || typeof event.type!=='string') return;
+    const type=event.type, data=event.data && typeof event.data==='object' ? event.data : {};
+    if (type==='chat:completion' || type==='response:completion') {
+      const responseType=String(data.type || '');
+      if (responseType.includes('reasoning') && responseType.endsWith('.delta')) appendReasoning(live,data.delta || '');
+      if (responseType.endsWith('output_text.delta')) appendAnswer(live,data.delta || '');
+      if (responseType.includes('function_call')) {
+        const item=data.item || data;
+        liveToolStep(live,item.call_id || item.id || 'function-call',item.name ? `Appel : ${item.name}` : 'Appel de fonction en cours',
+          responseType.endsWith('output_item.done') && ['completed','complete'].includes(String(item.status || '').toLowerCase()));
+      }
+      if (responseType==='response.completed' || responseType==='response.done') {
+        const result=data.response || {};
+        (Array.isArray(result.output)?result.output:[]).forEach((item,index)=>{
+          if (item?.type==='function_call') liveToolStep(live,item.call_id || item.id || `function-${index}`,`Appel : ${item.name || 'fonction'}`,true);
+          if (item?.type==='reasoning') appendReasoning(live,(item.summary || []).map(part=>part.text || '').join(''));
+          if (item?.type==='message') renderContentBlocks(item.content || [],live);
+        });
+      }
+      const choices=Array.isArray(data.choices)?data.choices:[];
+      choices.forEach((choice,index)=>{
+        const delta=choice?.delta && typeof choice.delta==='object' ? choice.delta : {};
+        appendReasoning(live,delta.reasoning_content || delta.reasoning || delta.thinking || '');
+        appendAnswer(live,delta.content || '');
+        (Array.isArray(delta.tool_calls)?delta.tool_calls:[]).forEach((call,i)=>{
+          const fn=call?.function || {}, index=call?.index ?? i;
+          const state=live.toolCallStates.get(index) || {key:call?.id || `call-${index}`,name:''};
+          if (call?.id) state.key=call.id;
+          if (typeof fn.name==='string') state.name+=fn.name;
+          live.toolCallStates.set(index,state);
+          liveToolStep(live,state.key,state.name ? `Appel : ${state.name}` : 'Appel de fonction en cours');
+        });
+      });
+      if (typeof data.content==='string') appendAnswer(live,data.content,true);
+      if (Array.isArray(data.content)) renderContentBlocks(data.content,live);
+      if (Array.isArray(data.output)) renderContentBlocks(data.output,live);
+      if (data.done===true) live.toolSteps.forEach(step=>{step.checkbox.checked=true;step.checkbox.indeterminate=false;});
+    } else if (type==='status') {
+      const label=String(data.description || data.action || 'Action du class tool');
+      liveToolStep(live,data.action || data.id || label,label,data.done===true);
+    } else if (type==='files' || type==='chat:message:files') {
+      (Array.isArray(data.files)?data.files:[]).forEach((file,index)=>{
+        const title=file?.filename || file?.name || `Fichier ${index+1}`;
+        addLiveArtifact(live,file?.id || title,title,file?.content || file?.text || '', 'text');
+      });
+    } else if (type==='embeds' || type==='chat:message:embeds') {
+      (Array.isArray(data.embeds)?data.embeds:[]).forEach((embed,index)=>{
+        addLiveArtifact(live,`embed-${index}`,`Artefact ${index+1}`,embed,'embed');
+      });
+    }
+    if (/artifact|artefact/i.test(type)) {
+      const records=Array.isArray(data.artifacts)?data.artifacts:[(data.artifact && typeof data.artifact==='object')?data.artifact:data];
+      records.forEach((artifact,index)=>{
+        const title=artifact.title || artifact.name || `Artefact ${index+1}`;
+        const key=artifact.id || artifact.artifact_id || title;
+        let content=artifact.markdown ?? artifact.content ?? artifact.html ?? artifact.text ?? artifact.delta ?? '';
+        if (type.endsWith('delta')) content=(live.artifactItems.get(String(key))?.body.querySelector('pre')?.textContent || '')+content;
+        const isHtml=typeof artifact.html==='string' || String(artifact.content_type || artifact.mime_type || '').includes('html');
+        addLiveArtifact(live,key,title,content,isHtml?'embed':'text');
+      });
+    }
+    if (type==='chat:message:error') addSystemLine(data.content || data.message || 'Erreur du class tool.');
+    $('messages').scrollTop=$('messages').scrollHeight;
+  }
+  function renderContentBlocks(blocks,live) {
+    blocks.forEach((block,index)=>{
+      if (!block || typeof block!=='object') return;
+      const type=String(block.type || '').toLowerCase();
+      if (block.artifact || block.artifact_id) {
+        const artifact=block.artifact || block, title=artifact.title || artifact.name || 'Artefact';
+        const content=artifact.markdown ?? artifact.content ?? artifact.html ?? artifact.text ?? '';
+        addLiveArtifact(live,artifact.id || artifact.artifact_id || title,title,content,artifact.html?'embed':'text');
+      } else if (type.includes('reason')) appendReasoning(live,block.text || block.content || '');
+      else if (type.includes('tool') || type.includes('function_call')) {
+        const key=block.call_id || block.id || `tool-${index}`, name=block.name || block.function?.name || 'Fonction';
+        const done=['completed','success','done'].includes(String(block.status || '').toLowerCase());
+        liveToolStep(live,key,`${name}${done?' · terminée':' · en cours'}`,done);
+      } else if (typeof block.text==='string') appendAnswer(live,block.text,true);
+    });
+  }
+  function addSystemLine(text) {
+    const line=document.createElement('div'); line.className='chat-status'; line.setAttribute('role','status'); line.textContent=text;
+    $('messages').appendChild(line); $('messages').scrollTop=$('messages').scrollHeight;
+  }
+  function formattedDollars(micro, decimals) {
+    if (!Number.isSafeInteger(micro) || micro < 0) return null;
+    const value=BigInt(micro);
+    if (decimals===2) {
+      const cents=(value+5000n)/10000n;
+      return `${cents/100n},${String(cents%100n).padStart(2,'0')}`;
+    }
+    const whole=value/1000000n, remainder=value%1000000n;
+    let fraction=String(remainder).padStart(6,'0');
+    fraction=fraction.replace(/0+$/,'');
+    return `${whole},${fraction || '0'}`;
+  }
+  function updateCreditBalance(micro) {
+    if (!Number.isSafeInteger(micro) || micro < 0) return false;
+    const balanceText=formattedDollars(micro,2);
+    if (balanceText===null) return false;
+    $('credit-label').textContent=`${balanceText} $ de crédit`;
+    const meter=$('credit-meter');
+    meter.setAttribute('aria-valuenow',String(micro));
+    meter.setAttribute('aria-valuemax','5000000');
+    meter.querySelector('span').style.width=Math.min(100,micro/5000000*100)+'%';
+    return true;
+  }
+  function addCostLine(bubble,modelId,charged,balance) {
+    const balanceText=formattedDollars(balance,2);
+    const chargedText=formattedDollars(charged,6);
+    if (balanceText===null || chargedText===null) return;
+    const line=document.createElement('div'); line.className='hint';
+    line.textContent=['coach-gratuit-1','coach-gratuit-2'].includes(modelId)
+      ? `Gratuit · Solde : ${balanceText} $`
+      : `Coût : ${chargedText} $ · Solde : ${balanceText} $`;
+    bubble.appendChild(line);
+  }
+  loadOpenWebUIModels();
+  loadContextSelection();
+  const query=new URLSearchParams(location.search);
+  if(query.get('strava')==='connected'){
+    history.replaceState({},'',location.pathname);
+    open();
+    syncStrava(); // first connection imports up to the latest 20 activities
+  } else if(query.get('strava')==='refreshed'){
+    history.replaceState({},'',location.pathname);
+  }
+})();
